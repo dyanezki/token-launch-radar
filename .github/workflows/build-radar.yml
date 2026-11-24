@@ -1,0 +1,80 @@
+name: Build token launch radar
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-radar.yml'
+      - 'Token-Launch-Radar.zip'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build offline dashboard
+        run: |
+          mkdir radar
+          unzip -q Token-Launch-Radar.zip -d radar
+          cd radar
+          node main.ts --input input --output out --preview
+      - name: Test and capture board, detail and filter
+        working-directory: radar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p screenshots
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory out > "$RUNNER_TEMP/radar-http.log" 2>&1 &
+          server=$!
+          trap 'kill "$server" || true' EXIT
+          url=http://127.0.0.1:8765/dashboard/index.html
+          curl --retry 12 --retry-all-errors --retry-delay 1 -fsS "$url" -o /dev/null
+          slug=$(node -p "require('./out/board.json').rows[0].slug")
+          capture() {
+            name=$1
+            route=$2
+            chrome_dir=$(mktemp -d)
+            google-chrome --headless --disable-gpu --disable-background-networking --hide-scrollbars --window-size=1380,920 --virtual-time-budget=3000 --user-data-dir="$chrome_dir" --screenshot="$PWD/screenshots/$name.png" --dump-dom "$url$route" > "$RUNNER_TEMP/$name.html"
+            test -s "screenshots/$name.png"
+          }
+          capture 1-board ''
+          capture 2-detail "#p=$slug"
+          capture 3-filtered '#category=Lending'
+          python3 - <<'PY'
+          import json, os, pathlib, re, struct
+          from html.parser import HTMLParser
+          class View(HTMLParser):
+              def __init__(self):
+                  super().__init__(); self.rows = 0; self.table = False; self.detail = False
+              def handle_starttag(self, tag, attrs):
+                  if tag == 'tbody': self.table = True
+                  if tag == 'tr' and self.table: self.rows += 1
+                  if tag == 'dialog' and 'open' in dict(attrs): self.detail = True
+              def handle_endtag(self, tag):
+                  if tag == 'tbody': self.table = False
+          rows = json.loads(pathlib.Path('out/board.json').read_text())['rows']
+          for shot in sorted(pathlib.Path('screenshots').glob('*.png')):
+              image = shot.read_bytes(); assert struct.unpack('>II', image[16:24]) == (1380, 920)
+              assert len(image) <= 524288
+              view = View(); view.feed((pathlib.Path(os.environ['RUNNER_TEMP']) / (shot.stem + '.html')).read_text())
+              expected = sum(r['category'] == 'Lending' for r in rows) if shot.stem == '3-filtered' else len(rows)
+              assert view.rows == expected and view.detail == (shot.stem == '2-detail'), (shot.name, view.rows, expected, view.detail)
+              print(shot.name, view.rows, 'rows', len(image), 'bytes')
+          PY
+      - name: Generate and verify final dossier
+        working-directory: radar
+        run: |
+          node main.ts --input input --output out
+          node main.ts --input input --output "$RUNNER_TEMP/replay"
+          diff -qr out "$RUNNER_TEMP/replay"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: token-launch-radar-build
+          path: radar/
+          if-no-files-found: error
